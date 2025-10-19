@@ -21,6 +21,9 @@
 
 *   **🚀 零成本接入** - 免费将 Smithery.ai 的多种模型接入现有 OpenAI 生态
 *   **🔌 高度兼容** - 完全模拟 OpenAI 的 `/v1/chat/completions` 和 `/v1/models` 接口
+*   **🛠️ 工具调用支持** - 完整支持 OpenAI Function Calling (Tools) 功能，实时流式工具执行
+*   **🖼️ 多模态支持** - 支持文本和图像输入，兼容 OpenAI 的多模态 API 格式
+*   **💨 实时流式响应** - 保持原生 SSE 流式体验，支持文本和工具调用的增量传输
 *   **🔄 多账号轮询** - 支持配置多个 Smithery.ai 账号，自动轮询提高稳定性
 *   **💨 无状态设计** - 极致轻量，易于水平扩展，保护用户隐私
 *   **☁️ 穿透 Cloudflare** - 内置自动处理 Cloudflare 防护机制
@@ -63,9 +66,25 @@ graph TB
 **输入 (OpenAI 格式)**:
 ```json
 {
-  "model": "gpt-4",
+  "model": "claude-haiku-4.5",
   "messages": [
     {"role": "user", "content": "你好，请介绍一下自己"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取天气信息",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string", "description": "城市名"}
+          },
+          "required": ["location"]
+        }
+      }
+    }
   ],
   "stream": true
 }
@@ -74,15 +93,29 @@ graph TB
 **输出 (Smithery.ai 格式)**:
 ```json
 {
-  "model": "gpt-4",
+  "model": "claude-haiku-4.5",
   "messages": [
     {
-      "role": "user", 
+      "role": "user",
       "parts": [{"type": "text", "text": "你好，请介绍一下自己"}],
       "id": "msg-xxxxxxxx"
     }
   ],
-  "stream": true
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "获取天气信息",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "location": {"type": "string", "description": "城市名"}
+        },
+        "required": ["location"],
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    }
+  ],
+  "systemPrompt": "You are a helpful assistant."
 }
 ```
 
@@ -107,19 +140,74 @@ class AuthCookie(BaseModel):
 
 #### 3. 流式响应处理
 
-**技术核心**: `app/utils/sse_utils.py` 和流式响应处理逻辑
+**技术核心**: `app/utils/sse_utils.py` 和 `app/providers/smithery_provider.py` 中的流式处理逻辑
 
 ```python
-async def handle_stream_response(response, model: str):
-    """处理流式响应并转换为 OpenAI 格式"""
-    async for line in response.iter_lines():
-        if line.startswith('data: '):
-            data = line[6:]  # 移除 'data: ' 前缀
-            if data == '[DONE]':
-                yield create_chat_completion_chunk("", "", finish_reason="stop")
-                break
-            # 解析和转换数据...
-            yield f"data: {json.dumps(converted_data)}\n\n"
+async def stream_generator() -> AsyncGenerator[bytes, None]:
+    """处理 Smithery.ai 流式响应并转换为 OpenAI 格式"""
+
+    # 维护工具调用状态
+    current_tool_call = {"id": None, "name": None}
+
+    for line in response.iter_lines():
+        if line.startswith(b"data:"):
+            data = json.loads(line[6:])
+            response_type = data.get("type", "")
+
+            # 处理文本流式响应
+            if response_type == "text-delta":
+                delta_content = data.get("delta", "")
+                chunk = create_chat_completion_chunk(request_id, model, delta_content)
+                yield create_sse_data(chunk)
+
+            # 处理工具调用开始
+            elif response_type == "tool-input-start":
+                tool_call_id = data.get("toolCallId")
+                tool_name = data.get("toolName")
+                current_tool_call.update({"id": tool_call_id, "name": tool_name})
+                chunk = create_tool_call_chunk(request_id, model, tool_call_id, tool_name)
+                yield create_sse_data(chunk)
+
+            # 处理工具参数增量数据
+            elif response_type == "tool-input-delta":
+                input_text_delta = data.get("inputTextDelta", "")
+                if input_text_delta:
+                    chunk = create_tool_call_chunk(
+                        request_id, model,
+                        current_tool_call["id"],
+                        current_tool_call["name"],
+                        input_text_delta
+                    )
+                    yield create_sse_data(chunk)
+```
+
+#### 4. 多模态内容处理
+
+**技术核心**: 支持文本和图像的混合输入
+
+```python
+def _convert_messages_to_smithery_format(self, openai_messages):
+    """支持多模态内容转换"""
+    for msg in openai_messages:
+        content = msg.get("content")
+        parts = []
+
+        if isinstance(content, list):  # 多模态内容
+            for item in content:
+                if item.get("type") == "text":
+                    parts.append({"type": "text", "text": item.get("text", "")})
+                elif item.get("type") == "image_url":
+                    image_url = item.get("image_url", {}).get("url", "")
+                    if image_url.startswith("data:image/"):
+                        media_type = self._extract_media_type_from_data_url(image_url)
+                        parts.append({
+                            "type": "file",
+                            "mediaType": media_type,
+                            "filename": f"image.{media_type.split('/')[1]}",
+                            "url": image_url
+                        })
+        elif isinstance(content, str):  # 纯文本内容
+            parts.append({"type": "text", "text": content})
 ```
 
 ---
@@ -165,19 +253,36 @@ vim .env
 # API 主密钥（用于客户端认证）
 API_MASTER_KEY="your-secure-master-key-here"
 
-# Smithery.ai 认证信息（支持多个账号）
+# 服务端口配置（默认 8000，可自定义）
+APP_PORT=3004
+
+# Smithery.ai 认证信息（支持多个账号轮询）
 SMITHERY_COOKIE_1='{"access_token":"eyJ...","token_type":"bearer","expires_in":3600,...}'
 SMITHERY_COOKIE_2='{"access_token":"eyJ...","token_type":"bearer","expires_in":3600,...}'
 
-# 服务端口配置
-NGINX_PORT=8088
-APP_PORT=8000
+# 会话管理（可选）
+SESSION_CACHE_TTL=3600
 ```
 
 #### 步骤 4: 启动服务
 
+**Docker 方式（推荐）**:
 ```bash
 docker-compose up -d
+```
+
+**本地开发方式**:
+```bash
+# 创建虚拟环境
+python -m venv .venv
+source .venv/bin/activate  # Linux/macOS
+# 或 .venv\Scripts\activate  # Windows
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 启动服务
+uvicorn main:app --reload --port 8000
 ```
 
 #### 步骤 5: 验证部署
@@ -185,8 +290,45 @@ docker-compose up -d
 使用 curl 测试服务是否正常运行：
 
 ```bash
-curl -X GET "http://localhost:8088/v1/models" \
+# 测试模型列表接口
+curl -X GET "http://localhost:3004/v1/models" \
   -H "Authorization: Bearer your-secure-master-key-here"
+
+# 测试聊天补全接口
+curl -X POST "http://localhost:3004/v1/chat/completions" \
+  -H "Authorization: Bearer your-secure-master-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-haiku-4.5",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+
+# 测试工具调用功能
+curl -X POST "http://localhost:3004/v1/chat/completions" \
+  -H "Authorization: Bearer your-secure-master-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-haiku-4.5",
+    "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get weather information",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {"type": "string", "description": "City name"}
+            },
+            "required": ["location"]
+          }
+        }
+      }
+    ],
+    "stream": true
+  }'
 ```
 
 ### 客户端配置示例
@@ -196,21 +338,68 @@ curl -X GET "http://localhost:8088/v1/models" \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8088/v1",
+    base_url="http://localhost:3004/v1",
     api_key="your-secure-master-key-here"
 )
 
+# 文本聊天
 response = client.chat.completions.create(
-    model="gpt-4",
+    model="claude-haiku-4.5",
     messages=[{"role": "user", "content": "Hello, world!"}],
+    stream=True
+)
+
+# 工具调用示例
+response = client.chat.completions.create(
+    model="claude-haiku-4.5",
+    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
+    tools=[
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather information",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string", "description": "City name"}
+                    },
+                    "required": ["location"]
+                }
+            }
+        }
+    ],
+    stream=True
+)
+
+# 多模态输入示例
+response = client.chat.completions.create(
+    model="claude-haiku-4.5",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What's in this image?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQSkZJRgABA..."}
+                }
+            ]
+        }
+    ],
     stream=True
 )
 ```
 
 **第三方应用配置**:
-- **Base URL**: `http://localhost:8088/v1`
+- **Base URL**: `http://localhost:3004/v1`
 - **API Key**: `your-secure-master-key-here`
-- **Model**: 任意支持的模型名称
+- **支持的功能**:
+  - ✅ 文本聊天
+  - ✅ 流式响应
+  - ✅ 工具调用 (Function Calling)
+  - ✅ 多模态输入 (文本+图像)
+  - ✅ 所有 Smithery.ai 支持的模型
 
 ---
 
