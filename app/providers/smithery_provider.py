@@ -169,7 +169,10 @@ class SmitheryProvider(BaseProvider):
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
             model = request_data.get("model", "claude-haiku-4.5")
-            
+
+            # 维护当前工具调用的状态
+            current_tool_call = {"id": None, "name": None}
+
             try:
                 # 3. 使用转换后的消息列表和工具定义准备请求体
                 payload = self._prepare_payload(model, smithery_formatted_messages, tools_from_client)
@@ -231,28 +234,34 @@ class SmitheryProvider(BaseProvider):
                                 tool_call_id = data.get("toolCallId", f"call_{uuid.uuid4().hex[:8]}")
                                 tool_name = data.get("toolName", "unknown_tool")
 
+                                # 保存当前工具调用状态
+                                current_tool_call["id"] = tool_call_id
+                                current_tool_call["name"] = tool_name
+
                                 # 发送工具调用开始的块
                                 chunk = create_tool_call_chunk(request_id, model, tool_call_id, tool_name)
                                 yield create_sse_data(chunk)
 
-                            # 处理工具输入增量数据（构建参数）
+                            # 处理工具输入增量数据（流式构建参数）
                             elif response_type == "tool-input-delta":
-                                # 这些是构建工具参数的增量数据，我们可以忽略，因为完整参数会在 tool-input-available 中提供
-                                continue
+                                # 使用保存的工具调用状态
+                                tool_call_id = current_tool_call["id"] or f"call_{uuid.uuid4().hex[:8]}"
+                                tool_name = current_tool_call["name"] or "unknown_tool"
+                                input_text_delta = data.get("inputTextDelta", "")
+
+                                # 发送工具调用参数的增量数据
+                                if input_text_delta:
+                                    chunk = create_tool_call_chunk(
+                                        request_id, model, tool_call_id, tool_name,
+                                        input_text_delta
+                                    )
+                                    yield create_sse_data(chunk)
 
                             # 处理工具输入完成（参数已完整）
                             elif response_type == "tool-input-available":
-                                tool_call_id = data.get("toolCallId", f"call_{uuid.uuid4().hex[:8]}")
-                                tool_name = data.get("toolName", "unknown_tool")
-                                tool_input = data.get("input", {})
-
-                                # 发送工具调用参数
-                                if tool_input:
-                                    chunk = create_tool_call_chunk(
-                                        request_id, model, tool_call_id, tool_name,
-                                        json.dumps(tool_input)
-                                    )
-                                    yield create_sse_data(chunk)
+                                # 工具参数已通过 tool-input-delta 流式发送，这里只是确认完成
+                                # 不需要再发送完整参数，因为已经通过增量发送了
+                                continue
 
                             # 处理传统的工具调用（保持向后兼容）
                             elif response_type.startswith("tool-"):
