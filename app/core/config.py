@@ -77,9 +77,10 @@ class Settings(BaseSettings):
     SESSION_CACHE_TTL: int = 3600
 
     KNOWN_MODELS: List[str] = [
-        "claude-haiku-4.5", "claude-sonnet-4.5", "gpt-5", "gpt-5-mini", 
-        "gpt-5-nano", "gemini-2.5-flash-lite", "gemini-2.5-pro", "glm-4.6", 
-        "grok-4-fast-non-reasoning", "grok-4-fast-reasoning", "kimi-k2", "deepseek-reasoner"
+        "claude-haiku-4.5", "claude-sonnet-4.5", "gpt-5", "gpt-5-mini",
+        "gpt-5-nano", "gpt-5.1-thinking", "gpt-5.1-instant", "gemini-2.5-flash-lite",
+        "gemini-2.5-flash", "glm-4.6", "grok-4-fast-non-reasoning", "grok-4-fast-reasoning",
+        "kimi-k2", "deepseek-reasoner"
     ]
 
     def __init__(self, **values):
